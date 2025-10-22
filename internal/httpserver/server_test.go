@@ -13,40 +13,67 @@ import (
 	"github.com/rafian-git/valuefirst-assignment/internal/store"
 )
 
-func newTestServer(t *testing.T) (*queue.Queue, *store.Store, http.Handler, context.CancelFunc) {
-	t.Helper()
+func TestPartialAndOverrideUpdates(t *testing.T) {
 	q := queue.New(64)
 	st := store.New()
 	ctx, cancel := context.WithCancel(context.Background())
 	q.StartWorkers(ctx, 2, func(ev queue.UpdateEvent) { st.Apply(ev) })
-	return q, st, New(q, st), cancel
+	h := New(q, st)
+	defer func() { cancel(); q.Close() }()
+
+	// price-only
+	postJSON(t, h, `{"product_id":"abc","price":10}`)
+	awaitProcessed()
+
+	// verify
+	price, stock := getPriceStock(t, h, "abc")
+	if price != 10 || stock != 0 {
+		t.Fatalf("after price-only: want price=10 stock=0, got price=%v stock=%d", price, stock)
+	}
+	// stock-only
+	postJSON(t, h, `{"product_id":"abc","stock":5}`)
+	awaitProcessed()
+
+	price, stock = getPriceStock(t, h, "abc")
+	if price != 10 || stock != 5 {
+		t.Fatalf("after stock-only: want price=10 stock=5, got price=%v stock=%d", price, stock)
+	}
+
+	// update price
+	postJSON(t, h, `{"product_id":"abc","price":20}`)
+	awaitProcessed()
+
+	price, stock = getPriceStock(t, h, "abc")
+	if price != 20 || stock != 5 {
+		t.Fatalf("after override: want price=20 stock=5, got price=%v stock=%d", price, stock)
+	}
 }
 
-func TestPostAndGet(t *testing.T) {
-	q, _, h, cancel := newTestServer(t)
-	defer func() { q.Close(); cancel() }()
-
-	body := []byte(`{"product_id":"abc","price":12.5,"stock":7}`)
-	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewReader(body))
+func postJSON(t *testing.T, h http.Handler, body string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/events", bytes.NewBufferString(body))
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusAccepted {
-		t.Fatalf("expected 202, got %d", rr.Code)
+		t.Fatalf("POST /events: expected 202, got %d body=%s", rr.Code, rr.Body.String())
 	}
+}
 
-	time.Sleep(50 * time.Millisecond)
-
-	req2 := httptest.NewRequest(http.MethodGet, "/products/abc", nil)
-	rr2 := httptest.NewRecorder()
-	h.ServeHTTP(rr2, req2)
-	if rr2.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rr2.Code)
+func getPriceStock(t *testing.T, h http.Handler, id string) (float64, int) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/products/"+id, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /products/%s: expected 200, got %d body=%s", id, rr.Code, rr.Body.String())
 	}
 	var got map[string]any
-	if err := json.Unmarshal(rr2.Body.Bytes(), &got); err != nil {
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
-	if got["price"].(float64) != 12.5 || int(got["stock"].(float64)) != 7 {
-		t.Fatalf("unexpected body: %v", got)
-	}
+	return got["price"].(float64), int(got["stock"].(float64))
+}
+
+func awaitProcessed() {
+	time.Sleep(30 * time.Millisecond) // small delay to allow worker to apply
 }
